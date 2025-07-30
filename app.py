@@ -8,8 +8,8 @@ import re
 from flask import Flask, request, jsonify
 
 # PDF parsing and layout analysis
-from pdfminer.high_level import extract_pages
-from pdfminer.layout import LTTextContainer, LTImage, LTChar, LTTextBoxHorizontal, LTTextLineHorizontal, LTAnno
+from pdfminer.high_level import extract_pages, extract_text
+from pdfminer.layout import LTTextContainer, LTImage, LTChar, LTTextBoxHorizontal, LTTextLineHorizontal, LTAnno, LTFigure
 from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
 from pdfminer.converter import TextConverter
 from pdfminer.layout import LAParams
@@ -36,221 +36,256 @@ MIN_CHARS_FOR_TEXT_PAGE = 50
 # Table detection parameters
 MIN_COLUMNS_FOR_TABLE = 2
 MIN_ROWS_FOR_TABLE = 2
-MAX_COLUMN_WIDTH_VARIANCE = 0.3  # 30% variance in column alignment
+COLUMN_ALIGNMENT_TOLERANCE = 15  # pixels
+ROW_HEIGHT_TOLERANCE = 5  # pixels
 
 # --- Helper Functions for Structured Extraction ---
 
 def clean_text(text):
     """Removes null bytes and other common problematic characters."""
-    return text.replace('\x00', '').strip()
+    if not text:
+        return ""
+    # Remove null bytes, excessive whitespace, but preserve structure
+    cleaned = text.replace('\x00', '').replace('\r\n', '\n').replace('\r', '\n')
+    # Remove excessive blank lines but keep paragraph structure
+    cleaned = re.sub(r'\n\s*\n\s*\n', '\n\n', cleaned)
+    return cleaned.strip()
 
-def detect_table_structure(text_boxes):
+def extract_text_from_container(container):
     """
-    Analyzes text boxes to detect tabular structure.
-    Returns list of table regions with their bounding boxes.
+    Properly extracts text from LTTextContainer, preserving word and line structure.
     """
-    if len(text_boxes) < MIN_ROWS_FOR_TABLE:
+    if not hasattr(container, '_objs'):
+        return container.get_text() if hasattr(container, 'get_text') else ""
+    
+    text_parts = []
+    for obj in container._objs:
+        if hasattr(obj, 'get_text'):
+            text_parts.append(obj.get_text())
+        elif hasattr(obj, '_objs'):
+            # Recursively extract from nested objects
+            text_parts.append(extract_text_from_container(obj))
+    
+    return ''.join(text_parts)
+
+def detect_table_structure(text_containers):
+    """
+    Improved table detection using container positioning and alignment.
+    """
+    if len(text_containers) < MIN_ROWS_FOR_TABLE:
         return []
     
-    # Group text boxes by approximate Y position (rows)
+    # Group containers by approximate Y position (rows)
     rows = {}
-    tolerance = 5  # pixels tolerance for row alignment
+    for container in text_containers:
+        # Use container center Y for more stable grouping
+        y_center = (container.y0 + container.y1) / 2
+        y_key = round(y_center / ROW_HEIGHT_TOLERANCE) * ROW_HEIGHT_TOLERANCE
+        
+        if y_key not in rows:
+            rows[y_key] = []
+        rows[y_key].append(container)
     
-    for box in text_boxes:
-        y_pos = round(box.y0 / tolerance) * tolerance
-        if y_pos not in rows:
-            rows[y_pos] = []
-        rows[y_pos].append(box)
-    
-    # Sort rows by Y position (top to bottom)
+    # Sort rows by Y position (top to bottom in PDF coordinates)
     sorted_rows = sorted(rows.items(), key=lambda x: -x[0])  # Negative for top-to-bottom
     
-    # Analyze column structure
-    potential_tables = []
-    current_table_rows = []
+    # Analyze potential table rows
+    table_candidates = []
+    current_table = []
     
-    for y_pos, row_boxes in sorted_rows:
-        # Sort boxes in row by X position (left to right)
-        row_boxes.sort(key=lambda x: x.x0)
+    for y_pos, row_containers in sorted_rows:
+        # Sort containers in each row by X position (left to right)
+        row_containers.sort(key=lambda x: x.x0)
         
-        # Check if this row has similar column structure to previous rows
-        if len(row_boxes) >= MIN_COLUMNS_FOR_TABLE:
-            if not current_table_rows:
-                current_table_rows = [row_boxes]
-            else:
-                # Check column alignment with previous row
-                prev_row = current_table_rows[-1]
-                if len(row_boxes) == len(prev_row):
-                    # Check if columns are roughly aligned
-                    aligned = True
-                    for i, (curr_box, prev_box) in enumerate(zip(row_boxes, prev_row)):
-                        x_diff = abs(curr_box.x0 - prev_box.x0)
-                        if x_diff > (prev_box.width * MAX_COLUMN_WIDTH_VARIANCE):
-                            aligned = False
-                            break
+        # Check if row has enough containers to be a table row
+        if len(row_containers) >= MIN_COLUMNS_FOR_TABLE:
+            # Check column alignment with previous row if exists
+            if current_table:
+                prev_row = current_table[-1]
+                if len(row_containers) == len(prev_row):
+                    # Check horizontal alignment
+                    alignment_matches = 0
+                    for i, (curr, prev) in enumerate(zip(row_containers, prev_row)):
+                        if abs(curr.x0 - prev.x0) <= COLUMN_ALIGNMENT_TOLERANCE:
+                            alignment_matches += 1
                     
-                    if aligned:
-                        current_table_rows.append(row_boxes)
+                    # If most columns align, it's part of the same table
+                    if alignment_matches >= len(row_containers) * 0.7:  # 70% alignment threshold
+                        current_table.append(row_containers)
                     else:
-                        # End current table, start new one
-                        if len(current_table_rows) >= MIN_ROWS_FOR_TABLE:
-                            potential_tables.append(current_table_rows)
-                        current_table_rows = [row_boxes]
+                        # Start new table
+                        if len(current_table) >= MIN_ROWS_FOR_TABLE:
+                            table_candidates.append(current_table)
+                        current_table = [row_containers]
                 else:
-                    # Different number of columns, end current table
-                    if len(current_table_rows) >= MIN_ROWS_FOR_TABLE:
-                        potential_tables.append(current_table_rows)
-                    current_table_rows = [row_boxes]
+                    # Different column count, end current table
+                    if len(current_table) >= MIN_ROWS_FOR_TABLE:
+                        table_candidates.append(current_table)
+                    current_table = [row_containers]
+            else:
+                # First potential table row
+                current_table = [row_containers]
         else:
-            # Row doesn't have enough columns, end current table
-            if len(current_table_rows) >= MIN_ROWS_FOR_TABLE:
-                potential_tables.append(current_table_rows)
-            current_table_rows = []
+            # Not enough containers for table row, end current table
+            if len(current_table) >= MIN_ROWS_FOR_TABLE:
+                table_candidates.append(current_table)
+            current_table = []
     
     # Don't forget the last table
-    if len(current_table_rows) >= MIN_ROWS_FOR_TABLE:
-        potential_tables.append(current_table_rows)
+    if len(current_table) >= MIN_ROWS_FOR_TABLE:
+        table_candidates.append(current_table)
     
-    return potential_tables
+    return table_candidates
 
-def extract_table_text(table_rows):
+def format_table_text(table_rows):
     """
-    Extracts text from detected table structure in proper row format.
+    Formats detected table into proper row-based text.
     """
-    table_lines = []
+    formatted_rows = []
     
-    for row_boxes in table_rows:
-        # Sort boxes in row by X position
-        row_boxes.sort(key=lambda x: x.x0)
+    for row_containers in table_rows:
+        # Sort containers by X position
+        row_containers.sort(key=lambda x: x.x0)
         
         # Extract text from each cell
-        row_cells = []
-        for box in row_boxes:
-            cell_text = ""
-            for line in box:
-                if hasattr(line, '_objs'):
-                    for char in line._objs:
-                        if hasattr(char, 'get_text'):
-                            cell_text += char.get_text()
-                elif hasattr(line, 'get_text'):
-                    cell_text += line.get_text()
-            row_cells.append(clean_text(cell_text))
+        cell_texts = []
+        for container in row_containers:
+            cell_text = extract_text_from_container(container)
+            cell_text = clean_text(cell_text).replace('\n', ' ')  # Single line per cell
+            cell_texts.append(cell_text if cell_text else "")
         
-        # Join cells with spaces to maintain row structure
-        if row_cells:
-            table_lines.append(" ".join(row_cells))
+        # Join cells with appropriate spacing
+        row_text = " ".join(cell_texts)
+        if row_text.strip():
+            formatted_rows.append(row_text)
     
-    return "\n".join(table_lines)
+    return "\n".join(formatted_rows)
 
-def extract_structured_text_hybrid(pdf_path, page_number):
+def extract_structured_text_improved(pdf_path, page_number):
     """
-    Hybrid extraction combining PyMuPDF for general text and pdfminer.six for table detection.
-    Returns (structured_text_content, has_significant_text, has_images).
+    Improved hybrid extraction with better text quality and table detection.
     """
-    extracted_content_parts = []
-    page_text_chars = 0
     has_images_on_page = False
+    extracted_parts = []
+    page_text_chars = 0
     
     doc = None
     fp_pdfminer = None
 
     try:
-        # --- Pass 1: PyMuPDF for image detection and basic text ---
+        # --- Step 1: Check for images using PyMuPDF ---
         doc = fitz.open(pdf_path)
         page = doc.load_page(page_number)
         
-        # Check for images
         if page.get_images():
             has_images_on_page = True
 
-        # --- Pass 2: pdfminer.six for structured text and table detection ---
+        # --- Step 2: Extract structured content using pdfminer.six ---
         fp_pdfminer = open(pdf_path, 'rb')
+        
+        # Optimized LAParams for better text extraction
         laparams = LAParams(
             all_texts=True,
             detect_vertical=True,
-            word_margin=0.1,
-            char_margin=2.0,
-            line_margin=0.5,
-            boxes_flow=0.5
+            word_margin=0.1,    # Smaller margin for better word detection
+            char_margin=2.0,    # Reasonable character grouping
+            line_margin=0.5,    # Good line grouping
+            boxes_flow=0.5,     # Maintain reading order
+            all_texts=True
         )
         
         pages = extract_pages(fp_pdfminer, page_numbers=[page_number], laparams=laparams)
         
+        page_elements = []
+        all_text_containers = []
+        
+        # First pass: collect all text containers and detect images
         for page_layout in pages:
-            # Collect all text containers for table detection
-            text_boxes = []
-            non_table_elements = []
-            
             for element in page_layout._objs:
-                if isinstance(element, LTImage):
+                if isinstance(element, LTImage) or isinstance(element, LTFigure):
                     has_images_on_page = True
                 elif isinstance(element, LTTextContainer):
-                    text_boxes.append(element)
-            
-            # Detect tables
-            detected_tables = detect_table_structure(text_boxes)
-            
-            # Create set of table elements for exclusion from regular text
-            table_elements = set()
-            for table_rows in detected_tables:
-                for row in table_rows:
-                    for box in row:
-                        table_elements.add(id(box))
-            
-            # Process elements in order
-            page_elements = []
-            
-            for element in page_layout._objs:
-                if isinstance(element, LTTextContainer):
-                    element_id = id(element)
-                    
-                    # Check if this element is part of a table
-                    is_table_element = element_id in table_elements
-                    
-                    if is_table_element:
-                        # Find which table this element belongs to
-                        for table_rows in detected_tables:
-                            for row_idx, row in enumerate(table_rows):
-                                if any(id(box) == element_id for box in row):
-                                    # Only add table tags for the first element of the first row
-                                    if row_idx == 0 and id(row[0]) == element_id:
-                                        table_text = extract_table_text(table_rows)
-                                        page_elements.append(f"{TABLE_START_TAG}\n{table_text}\n{TABLE_END_TAG}")
-                                    break
-                    else:
-                        # Regular text element
-                        text_content = clean_text(element.get_text())
-                        if text_content:
-                            page_elements.append(text_content)
-                            page_text_chars += len(text_content)
-            
-            # Join all elements
-            if page_elements:
-                extracted_content_parts.append("\n".join(page_elements))
+                    all_text_containers.append(element)
         
-        # Fallback to PyMuPDF if pdfminer.six didn't extract much
-        if page_text_chars < 10:
-            fallback_text = clean_text(page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE))
-            if fallback_text:
-                extracted_content_parts.append(fallback_text)
-                page_text_chars += len(fallback_text)
+        # Detect tables from all text containers
+        detected_tables = detect_table_structure(all_text_containers)
+        
+        # Create set of table container IDs for exclusion from regular text
+        table_container_ids = set()
+        for table_rows in detected_tables:
+            for row_containers in table_rows:
+                for container in row_containers:
+                    table_container_ids.add(id(container))
+        
+        # Second pass: process elements in order
+        for page_layout in pages:
+            # Sort elements by position (top to bottom, left to right)
+            sorted_elements = sorted(
+                [elem for elem in page_layout._objs if isinstance(elem, LTTextContainer)],
+                key=lambda x: (-x.y1, x.x0)  # Top to bottom, left to right
+            )
+            
+            processed_tables = set()
+            
+            for element in sorted_elements:
+                element_id = id(element)
                 
-    except Exception as e:
-        print(f"Error in hybrid extraction for page {page_number}: {e}")
-        # Fallback to PyMuPDF only
-        if doc:
-            page = doc.load_page(page_number)
-            fallback_text = clean_text(page.get_text("text"))
-            extracted_content_parts.append(fallback_text)
-            page_text_chars += len(fallback_text)
+                # Check if this element is part of a table
+                if element_id in table_container_ids:
+                    # Find which table this element belongs to and process only once
+                    for table_idx, table_rows in enumerate(detected_tables):
+                        if table_idx in processed_tables:
+                            continue
+                            
+                        # Check if this element is the first element of this table
+                        first_container_id = id(table_rows[0][0])
+                        if element_id == first_container_id:
+                            table_text = format_table_text(table_rows)
+                            if table_text.strip():
+                                page_elements.append(f"{TABLE_START_TAG}\n{table_text}\n{TABLE_END_TAG}")
+                                page_text_chars += len(table_text)
+                            processed_tables.add(table_idx)
+                            break
+                else:
+                    # Regular text element
+                    text_content = extract_text_from_container(element)
+                    text_content = clean_text(text_content)
+                    if text_content:
+                        page_elements.append(text_content)
+                        page_text_chars += len(text_content)
         
+        # Join all elements with appropriate spacing
+        if page_elements:
+            extracted_parts.append("\n".join(page_elements))
+            
+    except Exception as e:
+        print(f"pdfminer.six extraction failed for page {page_number}: {e}")
+        
+        # Fallback to PyMuPDF with better text extraction
+        try:
+            if not doc:
+                doc = fitz.open(pdf_path)
+            page = doc.load_page(page_number)
+            
+            # Use PyMuPDF's text extraction with flags for better quality
+            fallback_text = page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES)
+            fallback_text = clean_text(fallback_text)
+            
+            if fallback_text:
+                extracted_parts.append(fallback_text)
+                page_text_chars += len(fallback_text)
+                print(f"Using PyMuPDF fallback for page {page_number}")
+        except Exception as fallback_error:
+            print(f"Both extraction methods failed for page {page_number}: {fallback_error}")
+            
     finally:
         if doc:
             doc.close()
         if fp_pdfminer:
             fp_pdfminer.close()
 
-    final_text = "\n\n".join(extracted_content_parts).strip()
+    # Combine all extracted parts
+    final_text = "\n\n".join(extracted_parts).strip()
     has_significant_text = (page_text_chars >= MIN_CHARS_FOR_TEXT_PAGE)
 
     return final_text, has_significant_text, has_images_on_page
@@ -265,48 +300,51 @@ def process_document(file_content, filename, original_payload):
         with open(temp_file_path, 'wb') as f:
             f.write(file_content)
 
-        # Get page count and metadata using PyMuPDF
+        # Get page count using PyMuPDF
         try:
             doc = fitz.open(temp_file_path)
             num_pages = doc.page_count
-            
-            # Extract metadata (similar to n8n node)
-            metadata = doc.metadata
             doc.close()
         except Exception as e:
             raise RuntimeError(f"Failed to open PDF: {e}. It might be corrupted or not a valid PDF.")
 
-        # Process each page with hybrid approach
+        # Process each page with improved extraction
         for page_num in range(num_pages):
-            page_content_text, has_significant_text, has_images_on_page_actual = extract_structured_text_hybrid(temp_file_path, page_num)
+            try:
+                page_content_text, has_significant_text, has_images_on_page_actual = extract_structured_text_improved(temp_file_path, page_num)
 
-            # Page type determination logic (same as before)
-            if not has_significant_text and has_images_on_page_actual:
-                print(f"Page {page_num + 1} detected as image-heavy (no significant text, has raster images). Inserting placeholder.")
-                total_extracted_text_pages.append(IMAGE_PAGE_PLACEHOLDER)
-            elif not has_significant_text and not has_images_on_page_actual:
-                print(f"Page {page_num + 1} detected as truly empty.")
-                total_extracted_text_pages.append("")
-            else:
-                print(f"Page {page_num + 1} has significant text. Extracting structured content.")
-                
-                # Add inline image placeholder if needed
-                final_page_output = page_content_text
-                if has_images_on_page_actual and has_significant_text:
-                    if INLINE_IMAGE_PLACEHOLDER not in page_content_text:
-                        final_page_output += f"\n\n{INLINE_IMAGE_PLACEHOLDER}"
+                # Page type determination
+                if not has_significant_text and has_images_on_page_actual:
+                    print(f"Page {page_num + 1} detected as image-heavy. Inserting placeholder.")
+                    total_extracted_text_pages.append(IMAGE_PAGE_PLACEHOLDER)
+                elif not has_significant_text and not has_images_on_page_actual:
+                    print(f"Page {page_num + 1} detected as empty.")
+                    total_extracted_text_pages.append("")
+                else:
+                    print(f"Page {page_num + 1} has significant text. Extracting content.")
+                    
+                    # Add inline image placeholder if needed
+                    final_page_output = page_content_text
+                    if has_images_on_page_actual and has_significant_text:
+                        if INLINE_IMAGE_PLACEHOLDER not in page_content_text:
+                            final_page_output += f"\n\n{INLINE_IMAGE_PLACEHOLDER}"
 
-                total_extracted_text_pages.append(final_page_output)
+                    total_extracted_text_pages.append(final_page_output)
+                    
+            except Exception as page_error:
+                print(f"Error processing page {page_num + 1}: {page_error}")
+                # Add empty placeholder for failed pages
+                total_extracted_text_pages.append(f"[Error processing page {page_num + 1}]")
 
-    # Combine all page texts
+    # Combine all page texts with clear separators
     full_document_text = "\n\n--- PAGE BREAK ---\n\n".join(total_extracted_text_pages)
 
-    # --- Conditional Return for Testing / Send to n8n ---
+    # --- Return or send to n8n ---
     if RETURN_DIRECTLY_FOR_TESTING:
         print("RETURN_DIRECTLY_FOR_TESTING is active. Returning extracted text directly.")
         return {
             "success": True,
-            "message": "Extracted text returned directly for testing with hybrid approach.",
+            "message": "Extracted text returned directly for testing with improved hybrid approach.",
             "extracted_text": full_document_text,
             "filename": filename,
             "page_count": num_pages,
@@ -322,37 +360,26 @@ def process_document(file_content, filename, original_payload):
         }
 
         print(f"Sending data to n8n workflow at: {N8N_WEBHOOK_URL}")
-        print(f"Payload (excluding full text for brevity in logs): { {k: v for k, v in n8n_payload.items() if k != 'extracted_text'} }")
 
         if not N8N_WEBHOOK_URL:
-            raise ValueError("N8N_WEBHOOK_URL environment variable is not set. Cannot send to n8n.")
+            raise ValueError("N8N_WEBHOOK_URL environment variable is not set.")
 
         try:
             n8n_response = requests.post(N8N_WEBHOOK_URL, json=n8n_payload, timeout=300)
             n8n_response.raise_for_status()
-
-            n8n_result = n8n_response.json()
-            print(f"n8n workflow response: {n8n_result}")
-            return n8n_result
+            return n8n_response.json()
 
         except requests.exceptions.Timeout:
             raise RuntimeError("Request to n8n workflow timed out.")
         except requests.exceptions.RequestException as e:
-            print(f"Error communicating with n8n workflow: {e}")
-            try:
-                error_details = n8n_response.json()
-            except (json.JSONDecodeError, AttributeError):
-                error_details = n8n_response.text if n8n_response else "No response body."
+            error_details = getattr(n8n_response, 'text', 'No response body')
             raise RuntimeError(f"Failed to send data to n8n workflow: {e}. Details: {error_details}")
-        except Exception as e:
-            print(f"An unexpected error occurred during n8n communication: {e}")
-            raise RuntimeError(f"An unexpected error occurred during n8n communication: {e}")
 
 @app.route('/process_document', methods=['POST'])
 def process_document_endpoint():
     request_json = request.get_json(silent=True)
     
-    # Handle original_payload coming from either JSON body or form data
+    # Handle original_payload
     if request_json:
         original_payload = {
             "subject_id": request_json.get("subject_id"),
@@ -369,6 +396,7 @@ def process_document_endpoint():
     file_content = None
     filename = "document.pdf"
 
+    # Handle file input
     if 'file' in request.files:
         file = request.files['file']
         if file.filename == '':
@@ -391,18 +419,16 @@ def process_document_endpoint():
         except requests.exceptions.RequestException as e:
             return jsonify({"error": f"Error fetching URL: {e}"}), 400
     else:
-        return jsonify({"error": "No file or file_url provided, or 'file' is missing in multipart form data."}), 400
+        return jsonify({"error": "No file or file_url provided"}), 400
 
     if not file_content:
-        return jsonify({"error": "Could not retrieve file content."}), 500
+        return jsonify({"error": "Could not retrieve file content"}), 500
 
     try:
         response_from_processor = process_document(file_content, filename, original_payload)
         return jsonify(response_from_processor), 200
 
-    except ValueError as e:
-        return jsonify({"error": str(e)}), 500
-    except RuntimeError as e:
+    except (ValueError, RuntimeError) as e:
         return jsonify({"error": str(e)}), 500
     except Exception as e:
         print(f"General error in /process_document endpoint: {e}")
@@ -410,8 +436,7 @@ def process_document_endpoint():
 
 if __name__ == '__main__':
     if not N8N_WEBHOOK_URL and not RETURN_DIRECTLY_FOR_TESTING:
-        print("WARNING: Neither N8N_WEBHOOK_URL nor RETURN_DIRECTLY_FOR_TESTING is set. "
-              "The service will not send data anywhere or return useful results.")
+        print("WARNING: Neither N8N_WEBHOOK_URL nor RETURN_DIRECTLY_FOR_TESTING is set.")
     elif N8N_WEBHOOK_URL and RETURN_DIRECTLY_FOR_TESTING:
         print("WARNING: Both N8N_WEBHOOK_URL and RETURN_DIRECTLY_FOR_TESTING are set. "
               "RETURN_DIRECTLY_FOR_TESTING will take precedence.")
