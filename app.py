@@ -1,20 +1,3 @@
-You're encountering a `NameError` because the variable `page_text_chars` was not guaranteed to be defined in all execution paths within the `extract_structured_text` function. Specifically, it was initialized inside the `try` block, and if an error occurred before that line, it wouldn't exist when referenced later.
-
-**The Fix:**
-
-I've made the following corrections in the `app.py` code:
-
-1.  **Initialized `page_text_chars = 0`** at the very beginning of the `extract_structured_text` function, outside the `try` block, ensuring it's always defined.
-2.  **Simplified `has_images_on_page` logic** within `extract_structured_text` to be more consistent.
-3.  **Corrected the conditional check in `process_document`** to use `has_significant_text` (which `extract_structured_text` returns) instead of a potentially undefined `page_text_chars` from outside its scope.
-
-Here is the corrected `app.py` code. Please replace your current `app.py` with this updated version and redeploy your Render service.
-
------
-
-### **`app.py` (Corrected Code - Version 4)**
-
-```python
 import io
 import requests
 import os
@@ -283,5 +266,3 @@ if __name__ == '__main__':
               "RETURN_DIRECTLY_FOR_TESTING will take precedence.")
 
     app.run(debug=True, host='0.0.0.0', port=os.environ.get('PORT', 8000))
-
-```
