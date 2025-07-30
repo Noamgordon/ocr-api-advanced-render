@@ -43,4 +43,4 @@ COPY . .
 EXPOSE 8000
 
 # Command to run your application using Gunicorn.
-CMD gunicorn app:app -w 4 --bind 0.0.0.0:$PORT --timeout 120
+CMD gunicorn app:app -w 4 --bind 0.0.0.0:$PORT --timeout 300
