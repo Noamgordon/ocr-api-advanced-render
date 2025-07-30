@@ -9,12 +9,12 @@ from flask import Flask, request, jsonify
 
 # PDF parsing and layout analysis
 from pdfminer.high_level import extract_pages
-from pdfminer.layout import LTTextContainer, LTImage, LTChar, LTTextBoxHorizontal, LTTextLineHorizontal, LTAnno, LTCurve, LTRect
+from pdfminer.layout import LTTextContainer, LTImage, LTChar, LTTextBoxHorizontal, LTTextLineHorizontal
 from pdfminer.pdfinterp import PDFResourceManager, PDFPageInterpreter
 from pdfminer.converter import TextConverter
-from pdfminer.layout import LAParams
+from pdfminer.layout import LAParams # For basic layout parameters for image detection
 
-# PyMuPDF for robust PDF handling and metadata
+# PyMuPDF for robust PDF handling and text extraction
 import fitz # PyMuPDF is imported as fitz
 
 app = Flask(__name__)
@@ -22,7 +22,7 @@ app = Flask(__name__)
 # --- Configuration from Environment Variables ---
 N8N_WEBHOOK_URL = os.environ.get('N8N_WEBHOOK_URL')
 RETURN_DIRECTLY_FOR_TESTING = os.environ.get('RETURN_DIRECTLY_FOR_TESTING', 'false').lower() == 'true'
-ENABLE_GOOGLE_OCR = os.environ.get('ENABLE_GOOGLE_OCR', 'false').lower() == 'true' # Not implemented in this version, but kept for future use
+ENABLE_GOOGLE_OCR = os.environ.get('ENABLE_GOOGLE_OCR', 'false').lower() == 'true' # For future module additions
 
 # --- Constants for Structured Extraction ---
 IMAGE_PAGE_PLACEHOLDER = "[IMAGE PAGE - NO OCR PERFORMED]"
@@ -31,17 +31,18 @@ TABLE_START_TAG = "<BEGINNING_OF_TABULAR_CONTENT>"
 TABLE_END_TAG = "<END_OF_TABULAR_CONTENT>"
 
 # Minimum number of text characters on a page to consider it "text-heavy"
-MIN_CHARS_FOR_TEXT_PAGE = 50
+# and not an image-only page (even if it has images). Very low to ensure
+# even sparse text is extracted.
+MIN_CHARS_FOR_TEXT_PAGE = 50 
 
-# Table detection parameters (adjusted for better flexibility)
-# These parameters are heuristics and might need fine-tuning for specific document types.
-# They aim to identify grid-like text structures.
-MIN_COLUMNS_FOR_TABLE = 2
-MIN_ROWS_FOR_TABLE = 2
-# Max variance in X-coordinates for column alignment (percentage of page width)
-MAX_COLUMN_X_VARIANCE_PERCENT = 0.02 # 2% of page width
-# Max variance in Y-coordinates for row alignment (percentage of page height)
-MAX_ROW_Y_VARIANCE_PERCENT = 0.01 # 1% of page height
+# --- Table Detection Parameters (Conservative) ---
+# These parameters are tuned for high precision (fewer false positives)
+# even if it means lower recall (missing some complex tables).
+TABLE_ALIGNMENT_TOLERANCE_X = 5  # Max pixel difference for X-alignment of columns
+TABLE_ALIGNMENT_TOLERANCE_Y = 3  # Max pixel difference for Y-alignment of rows
+MIN_TABLE_ROWS = 2               # Minimum number of rows to consider it a table
+MIN_TABLE_COLUMNS = 2            # Minimum number of columns to consider it a table
+MIN_COMMON_X_COORDS = 0.8        # Minimum proportion of common X-coordinates for column alignment
 
 # --- Helper Functions for Structured Extraction ---
 
@@ -59,92 +60,88 @@ def get_text_from_element(element):
         return clean_text(element.get_text())
     return ""
 
-def detect_table_structure(text_boxes, page_width, page_height):
+def detect_table_structure(text_boxes):
     """
-    Analyzes text boxes to detect tabular structure based on horizontal and vertical alignment.
-    Returns a list of lists, where each inner list represents a detected table,
-    and contains the LTTextBoxHorizontal objects forming that table.
+    Analyzes text boxes to detect tabular structure based on strict horizontal and vertical alignment.
+    Returns a list of detected tables, where each table is a list of its rows (list of LTTextBoxHorizontal).
+    This function is designed to be highly conservative to avoid false positives.
     """
-    if len(text_boxes) < MIN_ROWS_FOR_TABLE:
+    if len(text_boxes) < MIN_TABLE_ROWS:
         return []
 
     # Sort text boxes primarily by Y-coordinate (top to bottom), then by X-coordinate (left to right)
-    # This helps in processing rows sequentially
     text_boxes.sort(key=lambda b: (-b.y1, b.x0))
 
-    potential_tables = []
+    detected_tables = []
     
-    # Group text boxes into potential rows based on Y-overlap
-    rows = []
+    # Step 1: Group text boxes into potential rows based on Y-overlap/proximity
+    rows_by_y = []
     if text_boxes:
         current_row = [text_boxes[0]]
         for i in range(1, len(text_boxes)):
-            # Check for significant Y-overlap or proximity to be considered part of the same row
-            # Use a small tolerance based on page height
-            y_tolerance = page_height * MAX_ROW_Y_VARIANCE_PERCENT
-            if abs(text_boxes[i].y1 - current_row[-1].y1) < y_tolerance or \
-               (text_boxes[i].y0 < current_row[-1].y1 and text_boxes[i].y1 > current_row[-1].y0):
+            # Check if current box's y-range overlaps significantly with the last box in current_row
+            # Or if they are very close vertically
+            if (text_boxes[i].y0 < current_row[-1].y1 and text_boxes[i].y1 > current_row[-1].y0) or \
+               (abs(text_boxes[i].y1 - current_row[-1].y1) < TABLE_ALIGNMENT_TOLERANCE_Y):
                 current_row.append(text_boxes[i])
             else:
-                rows.append(sorted(current_row, key=lambda b: b.x0)) # Sort by X for columns
+                rows_by_y.append(sorted(current_row, key=lambda b: b.x0)) # Sort by X for columns
                 current_row = [text_boxes[i]]
-        rows.append(sorted(current_row, key=lambda b: b.x0))
+        rows_by_y.append(sorted(current_row, key=lambda b: b.x0)) # Add the last row
 
-    # Analyze rows for consistent column alignment
+    # Step 2: Analyze rows for consistent column alignment to identify tables
     current_table_candidate = []
-    for row in rows:
-        if len(row) >= MIN_COLUMNS_FOR_TABLE:
-            if not current_table_candidate:
+    for row in rows_by_y:
+        if len(row) < MIN_TABLE_COLUMNS:
+            # Row doesn't have enough columns for a table, reset candidate
+            if len(current_table_candidate) >= MIN_TABLE_ROWS:
+                detected_tables.append(current_table_candidate)
+            current_table_candidate = []
+            continue
+
+        if not current_table_candidate:
+            # Start a new table candidate with this row
+            current_table_candidate.append(row)
+        else:
+            prev_row = current_table_candidate[-1]
+            
+            # Check if the number of columns is consistent
+            if len(row) != len(prev_row):
+                if len(current_table_candidate) >= MIN_TABLE_ROWS:
+                    detected_tables.append(current_table_candidate)
+                current_table_candidate = [row]
+                continue
+
+            # Check for strong X-alignment of columns across rows
+            # We'll compare the x0 (left edge) of corresponding cells
+            aligned_columns = 0
+            for i in range(len(row)):
+                if abs(row[i].x0 - prev_row[i].x0) < TABLE_ALIGNMENT_TOLERANCE_X:
+                    aligned_columns += 1
+            
+            # If a significant proportion of columns are aligned, consider it part of the table
+            if aligned_columns / len(row) >= MIN_COMMON_X_COORDS:
                 current_table_candidate.append(row)
             else:
-                prev_row = current_table_candidate[-1]
-                # Check if current row aligns with the previous row's columns
-                # This is a simplified check; more robust would involve clustering X-coordinates
-                
-                # If number of columns is different, it's likely a new table or not a table
-                if len(row) != len(prev_row):
-                    if len(current_table_candidate) >= MIN_ROWS_FOR_TABLE:
-                        potential_tables.append(current_table_candidate)
-                    current_table_candidate = [row]
-                    continue
-
-                # Check X-alignment of columns
-                aligned = True
-                x_tolerance = page_width * MAX_COLUMN_X_VARIANCE_PERCENT
-                for i in range(len(row)):
-                    # Check if the start of the current box is close to the start of the previous row's corresponding box
-                    if abs(row[i].x0 - prev_row[i].x0) > x_tolerance:
-                        aligned = False
-                        break
-                
-                if aligned:
-                    current_table_candidate.append(row)
-                else:
-                    # Not aligned, end current table and start a new one
-                    if len(current_table_candidate) >= MIN_ROWS_FOR_TABLE:
-                        potential_tables.append(current_table_candidate)
-                    current_table_candidate = [row]
-        else:
-            # Row doesn't have enough columns, end current table candidate
-            if len(current_table_candidate) >= MIN_ROWS_FOR_TABLE:
-                potential_tables.append(current_table_candidate)
-            current_table_candidate = []
+                # Not aligned, end current table and start a new one
+                if len(current_table_candidate) >= MIN_TABLE_ROWS:
+                    detected_tables.append(current_table_candidate)
+                current_table_candidate = [row]
     
     # Add the last table candidate if it meets the criteria
-    if len(current_table_candidate) >= MIN_ROWS_FOR_TABLE:
-        potential_tables.append(current_table_candidate)
+    if len(current_table_candidate) >= MIN_TABLE_ROWS:
+        detected_tables.append(current_table_candidate)
     
-    return potential_tables
+    return detected_tables
 
 def extract_table_text(table_rows):
     """
-    Extracts text from detected table structure in proper row format.
-    Assumes table_rows is a list of lists of LTTextBoxHorizontal objects,
-    where each inner list is a row, sorted by X-coordinate.
+    Extracts text from detected table structure in proper row format,
+    using tabs to separate columns.
     """
     table_lines = []
     for row_boxes in table_rows:
-        # Sort boxes in row by X position to ensure correct column order
+        # Ensure boxes in row are sorted by X position for correct column order
         row_boxes.sort(key=lambda x: x.x0)
         
         row_cells = []
@@ -152,162 +149,59 @@ def extract_table_text(table_rows):
             cell_text = get_text_from_element(box)
             row_cells.append(cell_text)
         
-        # Join cells with a tab or a consistent separator to indicate columns
-        # Using a tab makes it easier to parse into columns later
+        # Join cells with a tab to indicate columns
         table_lines.append("\t".join(row_cells))
     
     return "\n".join(table_lines)
 
-def extract_structured_text_hybrid(pdf_path, page_number):
+
+def extract_structured_text(pdf_path, page_number):
     """
-    Hybrid extraction combining PyMuPDF for general text and pdfminer.six for table detection.
-    Returns (structured_text_content, has_significant_text, has_images).
+    Extracts text content and inserts inline image placeholders from a specific PDF page.
+    Prioritizes PyMuPDF for text layout and pdfminer.six for image detection and table detection.
+    Returns (structured_text_content, has_significant_text, has_images, structured_tables_text).
     """
     extracted_content_parts = []
     page_text_chars = 0
     has_images_on_page = False
-    
+    structured_tables_text = [] # New list to store detected table text
+
     doc = None
     fp_pdfminer = None
 
     try:
-        # --- Pass 1: PyMuPDF for page dimensions, image detection, and fallback text ---
+        # --- Pass 1: PyMuPDF for main text content and image detection ---
         doc = fitz.open(pdf_path)
         page = doc.load_page(page_number)
-        page_width = page.rect.width
-        page_height = page.rect.height
         
-        # Check for images using PyMuPDF (more reliable for raster images)
+        # Extract text while preserving whitespace and ligatures for better layout
+        text_from_pymu = clean_text(page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_PRESERVE_LIGATURES))
+        extracted_content_parts.append(text_from_pymu)
+        page_text_chars += len(text_from_pymu)
+
+        # Update has_images_on_page based on PyMuPDF's direct image check
         if page.get_images():
             has_images_on_page = True
 
-        # --- Pass 2: pdfminer.six for structured text and table detection ---
+        # --- Pass 2: pdfminer.six for specific object detection (e.g., table structure) ---
         fp_pdfminer = open(pdf_path, 'rb')
-        # Adjusted LAParams for better text grouping and reading order
-        # word_margin: Larger value allows more space between words before splitting
-        # char_margin: Smaller value means characters must be closer to be part of the same word
-        # line_margin: Larger value allows more space between lines before splitting into new text boxes
-        # boxes_flow: Controls grouping of text boxes; 0.5 is a good default for reading order
-        laparams = LAParams(
-            all_texts=True,
-            detect_vertical=True,
-            word_margin=0.2,  # Increased from 0.1
-            char_margin=1.0,  # Decreased from 2.0
-            line_margin=0.6,  # Increased from 0.5
-            boxes_flow=0.5
-        )
-        
-        # Extract pages using pdfminer.six
+        # Use default LAParams for pdfminer.six to get raw layout objects for table detection
+        laparams = LAParams() 
         pages = extract_pages(fp_pdfminer, page_numbers=[page_number], laparams=laparams)
         
-        for page_layout in pages:
-            # Collect all text containers and sort them by their position (top-to-bottom, then left-to-right)
-            # This is crucial for maintaining correct reading order.
-            elements_on_page = []
-            for element in page_layout._objs:
-                # Filter out non-text and non-image elements that might interfere with layout analysis
-                if isinstance(element, (LTTextContainer, LTImage, LTCurve, LTRect)):
-                    elements_on_page.append(element)
+        for p in pages:
+            text_boxes_for_table_detection = []
+            for element in p._objs:
+                if isinstance(element, LTTextBoxHorizontal):
+                    text_boxes_for_table_detection.append(element)
             
-            # Sort elements by Y-coordinate (top to bottom), then by X-coordinate (left to right)
-            # This is the primary mechanism to ensure correct reading order.
-            elements_on_page.sort(key=lambda e: (-e.y1, e.x0))
-
-            text_boxes = [e for e in elements_on_page if isinstance(e, LTTextContainer)]
+            # Detect tables using the conservative strategy
+            detected_tables = detect_table_structure(text_boxes_for_table_detection)
             
-            # Detect tables using the sorted text boxes
-            detected_tables = detect_table_structure(text_boxes, page_width, page_height)
-            
-            # Create a set of IDs for text boxes that are part of detected tables
-            table_element_ids = set()
             for table_rows in detected_tables:
-                for row in table_rows:
-                    for box in row:
-                        table_element_ids.add(id(box))
-            
-            # Process elements in the determined reading order
-            for element in elements_on_page:
-                if isinstance(element, LTImage):
-                    # PyMuPDF is more reliable for general image detection, but pdfminer.six can also find them.
-                    # We'll rely on PyMuPDF's has_images_on_page_actual for the overall page image check.
-                    # This specific element processing is mainly for text and tables.
-                    pass 
-                elif isinstance(element, LTTextContainer):
-                    element_id = id(element)
-                    
-                    # Check if this text element is part of a detected table
-                    if element_id in table_element_ids:
-                        # If it's the first element of a table row, add the table content
-                        # This logic needs to be careful to avoid duplicating table content
-                        # We'll add the table content only once when we encounter the first element of a table.
-                        # To do this, we need to mark table elements as processed.
-                        
-                        # Find the table this element belongs to and its row index
-                        found_table = None
-                        for table_idx, table_rows in enumerate(detected_tables):
-                            for row_idx, row in enumerate(table_rows):
-                                if any(id(box) == element_id for box in row):
-                                    found_table = (table_idx, row_idx, table_rows)
-                                    break
-                            if found_table:
-                                break
-                        
-                        if found_table:
-                            table_idx, row_idx, current_table_data = found_table
-                            # Only add the table content if this is the very first box of the entire table
-                            # To prevent re-adding for every cell in the table.
-                            # We can achieve this by removing the table from detected_tables after processing
-                            # or by using a processed_tables set.
-                            
-                            # A simpler approach: if this element is part of a table, skip it here
-                            # and let the table extraction handle it separately.
-                            # We need to ensure the table is added only once.
-                            pass # Skip for now, will add tables after iterating all elements
-                    else:
-                        # Regular text element, not part of a table
-                        text_content = get_text_from_element(element)
-                        if text_content:
-                            extracted_content_parts.append(text_content)
-                            page_text_chars += len(text_content)
-                
-            # After processing all individual elements, add the detected tables.
-            # This ensures tables are added as distinct blocks after regular text that precedes them.
-            # To avoid duplicates, we need to ensure table text boxes are not added as regular text.
-            # The previous loop already ensured this by skipping elements in table_element_ids.
-            
-            # Now, iterate through detected_tables and add their content.
-            # We need to ensure each table is added only once.
-            added_table_hashes = set() # To prevent adding the same table multiple times
-            for table_rows in detected_tables:
-                # Create a unique hash for the table based on its first few elements' IDs
-                table_hash = hash(frozenset(id(box) for row in table_rows for box in row))
-                if table_hash not in added_table_hashes:
-                    table_text = extract_table_text(table_rows)
-                    if table_text.strip(): # Only add if there's actual content
-                        extracted_content_parts.append(f"{TABLE_START_TAG}\n{table_text}\n{TABLE_END_TAG}")
-                        added_table_hashes.add(table_hash)
-                        # Add characters from table text to page_text_chars count
-                        page_text_chars += len(table_text)
-
-        # Fallback to PyMuPDF if pdfminer.six didn't extract much or for empty pages
-        # This fallback is now more of a safety net for truly unparseable pages by pdfminer.six
-        if page_text_chars < MIN_CHARS_FOR_TEXT_PAGE and not extracted_content_parts:
-            fallback_text = clean_text(page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE))
-            if fallback_text:
-                extracted_content_parts.append(fallback_text)
-                page_text_chars += len(fallback_text)
-                print(f"Page {page_number + 1}: Falling back to PyMuPDF text extraction due to low pdfminer.six output.")
-                
-    except Exception as e:
-        print(f"Error in hybrid extraction for page {page_number}: {e}")
-        # Fallback to PyMuPDF only in case of an error during pdfminer.six processing
-        if doc:
-            page = doc.load_page(page_number)
-            fallback_text = clean_text(page.get_text("text", flags=fitz.TEXT_PRESERVE_WHITESPACE))
-            if fallback_text:
-                extracted_content_parts.append(fallback_text)
-                page_text_chars += len(fallback_text)
-                print(f"Page {page_number + 1}: Error fallback to PyMuPDF text extraction.")
+                table_content = extract_table_text(table_rows)
+                if table_content.strip():
+                    structured_tables_text.append(f"{TABLE_START_TAG}\n{table_content}\n{TABLE_END_TAG}")
         
     finally:
         if doc:
@@ -316,56 +210,66 @@ def extract_structured_text_hybrid(pdf_path, page_number):
             fp_pdfminer.close()
 
     final_text = "\n\n".join(extracted_content_parts).strip()
+
+    # Determine if the page has significant text based on character count
     has_significant_text = (page_text_chars >= MIN_CHARS_FOR_TEXT_PAGE)
 
-    return final_text, has_significant_text, has_images_on_page
+    return final_text, has_significant_text, has_images_on_page, structured_tables_text
 
+# --- Main Document Processing Function ---
 def process_document(file_content, filename, original_payload):
     total_extracted_text_pages = []
     num_pages = 0
     
-    # Store the PDF temporarily for processing
+    # Store the PDF temporarily for PyMuPDF and pdfminer.six
     with tempfile.TemporaryDirectory() as temp_dir:
         temp_file_path = os.path.join(temp_dir, filename)
         with open(temp_file_path, 'wb') as f:
             f.write(file_content)
 
-        # Get page count and metadata using PyMuPDF
+        # PyMuPDF for basic page count
         try:
             doc = fitz.open(temp_file_path)
             num_pages = doc.page_count
-            
-            # Extract metadata (similar to n8n node)
-            metadata = doc.metadata
-            doc.close()
+            doc.close() # Close immediately after getting page_count
         except Exception as e:
-            raise RuntimeError(f"Failed to open PDF: {e}. It might be corrupted or not a valid PDF.")
+            raise RuntimeError(f"Failed to open PDF with PyMuPDF for page count: {e}. It might be corrupted or not a valid PDF.")
 
-        # Process each page with hybrid approach
+        # Process each page
         for page_num in range(num_pages):
             print(f"Processing page {page_num + 1}...")
-            page_content_text, has_significant_text, has_images_on_page_actual = extract_structured_text_hybrid(temp_file_path, page_num)
+            # The returned `has_images_on_page_actual` and `has_significant_text` are derived directly from the page content analysis.
+            page_content_text, has_significant_text, has_images_on_page_actual, structured_tables = extract_structured_text(temp_file_path, page_num)
 
-            # Page type determination logic
+            # Heuristic for determining page type (text vs. image-only)
             if not has_significant_text and has_images_on_page_actual:
+                # If no significant text and it does have raster images, assume it's a scanned/image-only page.
                 print(f"Page {page_num + 1} detected as image-heavy (no significant text, has raster images). Inserting placeholder.")
                 total_extracted_text_pages.append(IMAGE_PAGE_PLACEHOLDER)
             elif not has_significant_text and not has_images_on_page_actual:
+                # Page is truly empty (no text, no images)
                 print(f"Page {page_num + 1} detected as truly empty.")
-                total_extracted_text_pages.append("")
+                total_extracted_text_pages.append("") 
             else:
+                # Page has significant text. Add text directly.
                 print(f"Page {page_num + 1} has significant text. Extracting structured content.")
                 
-                # Add inline image placeholder if needed
                 final_page_output = page_content_text
+                
+                # If images were detected on a page that also has text, we append the inline placeholder.
                 if has_images_on_page_actual and has_significant_text:
-                    # Only add if there are images and significant text, and the placeholder isn't already there
+                     # Only add if the text doesn't already implicitly contain it (from its original source)
                     if INLINE_IMAGE_PLACEHOLDER not in page_content_text:
                         final_page_output += f"\n\n{INLINE_IMAGE_PLACEHOLDER}"
 
+                # Append structured tables after the main page content
+                if structured_tables:
+                    final_page_output += "\n\n" + "\n\n".join(structured_tables)
+
                 total_extracted_text_pages.append(final_page_output)
 
-    # Combine all page texts with a clear page break marker
+
+    # Combine all page texts
     full_document_text = "\n\n--- PAGE BREAK ---\n\n".join(total_extracted_text_pages)
 
     # --- Conditional Return for Testing / Send to n8n ---
@@ -373,7 +277,7 @@ def process_document(file_content, filename, original_payload):
         print("RETURN_DIRECTLY_FOR_TESTING is active. Returning extracted text directly.")
         return {
             "success": True,
-            "message": "Extracted text returned directly for testing with hybrid approach.",
+            "message": "Extracted text returned directly for testing.",
             "extracted_text": full_document_text,
             "filename": filename,
             "page_count": num_pages,
@@ -389,16 +293,13 @@ def process_document(file_content, filename, original_payload):
         }
 
         print(f"Sending data to n8n workflow at: {N8N_WEBHOOK_URL}")
-        # Log payload without the full extracted text for brevity
-        log_payload = {k: v for k, v in n8n_payload.items() if k != 'extracted_text'}
-        log_payload['extracted_text_length'] = len(n8n_payload.get('extracted_text', ''))
-        print(f"Payload (excluding full text for brevity in logs): {log_payload}")
+        print(f"Payload (excluding full text for brevity in logs): { {k: v for k, v in n8n_payload.items() if k != 'extracted_text'} }")
 
         if not N8N_WEBHOOK_URL:
             raise ValueError("N8N_WEBHOOK_URL environment variable is not set. Cannot send to n8n.")
 
         try:
-            n8n_response = requests.post(N8N_WEBHOOK_URL, json=n8n_payload, timeout=300)
+            n8n_response = requests.post(N8N_WEBHOOK_URL, json=n8n_payload, timeout=300) # Increased timeout
             n8n_response.raise_for_status()
 
             n8n_result = n8n_response.json()
@@ -418,6 +319,7 @@ def process_document(file_content, filename, original_payload):
             print(f"An unexpected error occurred during n8n communication: {e}")
             raise RuntimeError(f"An unexpected error occurred during n8n communication: {e}")
 
+
 @app.route('/process_document', methods=['POST'])
 def process_document_endpoint():
     request_json = request.get_json(silent=True)
@@ -429,7 +331,7 @@ def process_document_endpoint():
             "user_id": request_json.get("user_id"),
             "subject_type": request_json.get("subject_type")
         }
-    else:
+    else: # Assume multipart/form-data with fields
         original_payload = {
             "subject_id": request.form.get("subject_id"),
             "user_id": request.form.get("user_id"),
