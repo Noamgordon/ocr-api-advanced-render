@@ -190,8 +190,7 @@ def extract_structured_text_improved(pdf_path, page_number):
             word_margin=0.1,    # Smaller margin for better word detection
             char_margin=2.0,    # Reasonable character grouping
             line_margin=0.5,    # Good line grouping
-            boxes_flow=0.5,     # Maintain reading order
-            all_texts=True
+            boxes_flow=0.5      # Maintain reading order
         )
         
         pages = extract_pages(fp_pdfminer, page_numbers=[page_number], laparams=laparams)
