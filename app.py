@@ -2,10 +2,17 @@
 import os
 import json
 import re
+import logging
 from functools import lru_cache
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 # Cache language data to avoid re-reading files on every request
 @lru_cache(maxsize=32)
@@ -15,8 +22,10 @@ def load_language_data(lang_id):
         os.path.dirname(__file__), "Languages", f"{lang_id}.json"
     )
     if not os.path.exists(lang_file_path):
+        logger.warning(f"Language file not found: {lang_file_path}")
         return None
     with open(lang_file_path, "r", encoding="utf-8") as f:
+        logger.info(f"Successfully loaded language data for: {lang_id}")
         return json.load(f)
 
 def clean_punctuation(text):
@@ -35,7 +44,7 @@ def clean_punctuation(text):
     return cleaned_text.strip()
 
 def filter_filler_words(text, phrases):
-    """Removes filler words from text using a list of phrases."""
+    """Removes filler words from text using a list of phrases, handling punctuation."""
     if not text or not phrases:
         return text
     
@@ -47,14 +56,21 @@ def filter_filler_words(text, phrases):
             continue
         
         escaped_phrase = re.escape(phrase)
-        # Regex to match whole words/phrases only
+        # Use a more flexible regex that matches the phrase surrounded by word boundaries or punctuation.
+        # This regex looks for the phrase as a whole word, optionally followed or preceded by punctuation.
+        # \b ensures it's a whole word, and [.,;:!?]? handles optional trailing punctuation.
         regex = re.compile(
-            rf"(?:^|(?<=[^\p{{L}}\p{{N}}]))({escaped_phrase})(?:$|(?=[^\p{{L}}\p{{N}}]))",
+            rf"\b({escaped_phrase})\b[.,;:!?]?",
             re.IGNORECASE | re.UNICODE,
         )
-        cleaned_text = regex.sub(" ", cleaned_text)
+        
+        match = regex.search(cleaned_text)
+        if match:
+            logger.info(f"Removed phrase '{phrase}'")
+            # Replace the match with a single space.
+            cleaned_text = regex.sub(" ", cleaned_text)
     
-    return cleaned_text
+    return re.sub(r'\s+', ' ', cleaned_text).strip()
 
 def detect_languages(text, languages_data):
     """Detects languages in a given text based on character sets."""
@@ -84,6 +100,7 @@ def detect_languages(text, languages_data):
                     
         if letter_count > 0 and (match_count / letter_count) >= threshold and len(matched_chars) >= 3:
             detected.append(lang_id)
+            logger.info(f"Detected language: {lang_id}")
             
     return detected
 
@@ -94,6 +111,7 @@ def clean_text_service():
     prompt = data.get("prompt", "")
     
     if not prompt:
+        logger.warning("Received an empty prompt.")
         return jsonify({"cleanedPrompt": ""})
     
     all_languages = {
@@ -103,7 +121,7 @@ def clean_text_service():
     detected_languages = detect_languages(prompt, all_languages)
     
     if not detected_languages:
-        # Default to English if no language is detected
+        logger.info("No language detected, defaulting to English.")
         detected_languages.append("english")
     
     cleaned_prompt = prompt
@@ -114,6 +132,8 @@ def clean_text_service():
             cleaned_prompt = filter_filler_words(cleaned_prompt, phrases_to_remove)
             
     cleaned_prompt = clean_punctuation(cleaned_prompt)
+    logger.info(f"Original prompt: '{prompt}'")
+    logger.info(f"Cleaned prompt: '{cleaned_prompt}'")
     
     return jsonify({"cleanedPrompt": cleaned_prompt})
 
