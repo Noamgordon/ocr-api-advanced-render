@@ -35,7 +35,7 @@ def clean_punctuation(text):
     
     cleaned_text = text
     cleaned_text = re.sub(r"\s+", " ", cleaned_text)
-    cleaned_text = re.sub(r"([.,;:!?])[.,;:!?]+", r"\1", cleaned_text)
+    cleaned_text = re.sub(r"([.,;:!?])\s*\1+", r"\1", cleaned_text)
     cleaned_text = re.sub(r"\s+([.,;:!?])", r"\1", cleaned_text)
     cleaned_text = re.sub(r"\s+([\")])", r"\1", cleaned_text)
     cleaned_text = re.sub(r"([([`\"])\s+", r"\1", cleaned_text)
@@ -43,95 +43,90 @@ def clean_punctuation(text):
     cleaned_text = re.sub(r"(\r\n|\n|\r){2,}", "\n", cleaned_text)
     return cleaned_text.strip()
 
-def filter_filler_words(text, phrases):
-    """Removes filler words from text using a list of phrases, handling punctuation."""
-    if not text or not phrases:
-        return text
-    
+def process_text_with_rules(text, rules):
+    """Applies a list of rules (remove, replace, with stop phrases) to a text."""
     cleaned_text = text
-    sorted_phrases = sorted(phrases, key=len, reverse=True)
     
-    for phrase in sorted_phrases:
-        if not phrase or len(phrase) < 2:
-            continue
+    for rule in rules:
+        action = rule.get("action")
+        phrases = rule.get("phrases", [])
+        with_text = rule.get("with", "")
+        stop_phrases = rule.get("stop_phrases", [])
         
-        escaped_phrase = re.escape(phrase)
-        # Use a more flexible regex that matches the phrase surrounded by word boundaries or punctuation.
-        # This regex looks for the phrase as a whole word, optionally followed or preceded by punctuation.
-        # \b ensures it's a whole word, and [.,;:!?]? handles optional trailing punctuation.
-        regex = re.compile(
-            rf"\b({escaped_phrase})\b[.,;:!?]?",
-            re.IGNORECASE | re.UNICODE,
-        )
+        # Sort phrases by length to prevent partial replacements
+        sorted_phrases = sorted(phrases, key=len, reverse=True)
         
-        match = regex.search(cleaned_text)
-        if match:
-            logger.info(f"Removed phrase '{phrase}'")
-            # Replace the match with a single space.
-            cleaned_text = regex.sub(" ", cleaned_text)
-    
-    return re.sub(r'\s+', ' ', cleaned_text).strip()
+        # Pre-compile stop phrase regexes for efficiency
+        stop_regexes = []
+        for p in stop_phrases:
+            stop_regexes.append(re.compile(r'\b' + re.escape(p) + r'\b', re.IGNORECASE | re.UNICODE))
 
-def detect_languages(text, languages_data):
-    """Detects languages in a given text based on character sets."""
-    if not text:
-        return []
-    
-    detected = []
-    for lang_id, lang_data in languages_data.items():
-        if not lang_data or not lang_data.get("detection"):
-            continue
-        
-        detection = lang_data["detection"]
-        char_set = set(detection.get("characters", "").lower())
-        threshold = detection.get("threshold", 0.3)
-        
-        match_count = 0
-        letter_count = 0
-        matched_chars = set()
-        
-        for char in text:
-            char = char.lower()
-            if char.isalpha():
-                letter_count += 1
-                if char in char_set:
-                    match_count += 1
-                    matched_chars.add(char)
-                    
-        if letter_count > 0 and (match_count / letter_count) >= threshold and len(matched_chars) >= 3:
-            detected.append(lang_id)
-            logger.info(f"Detected language: {lang_id}")
+        for phrase in sorted_phrases:
+            if not phrase or len(phrase) < 2:
+                continue
+
+            # Check for stop phrases first
+            should_stop = False
+            for stop_regex in stop_regexes:
+                if stop_regex.search(cleaned_text):
+                    should_stop = True
+                    logger.info(f"Stop phrase '{stop_regex.pattern}' found. Skipping action for '{phrase}'.")
+                    break
             
-    return detected
+            if should_stop:
+                continue
+
+            escaped_phrase = re.escape(phrase)
+            # Match the whole word, ignoring surrounding punctuation
+            regex = re.compile(
+                rf'\b{escaped_phrase}\b',
+                re.IGNORECASE | re.UNICODE
+            )
+            
+            if action == "remove":
+                if regex.search(cleaned_text):
+                    logger.info(f"Removed phrase '{phrase}'")
+                    cleaned_text = regex.sub(' ', cleaned_text)
+            elif action == "replace":
+                if regex.search(cleaned_text):
+                    logger.info(f"Replaced phrase '{phrase}' with '{with_text}'")
+                    cleaned_text = regex.sub(with_text, cleaned_text)
+    
+    return cleaned_text
 
 @app.route("/clean", methods=["POST"])
 def clean_text_service():
-    """API endpoint to clean text based on language rules."""
+    """API endpoint to clean text based on language and model rules."""
     data = request.json
     prompt = data.get("prompt", "")
+    model = data.get("model", "default")
     
     if not prompt:
         logger.warning("Received an empty prompt.")
         return jsonify({"cleanedPrompt": ""})
     
-    all_languages = {
-        "english": load_language_data("english"),
-    }
+    lang_id = f"english_{model.lower()}"
+    lang_data = load_language_data(lang_id)
     
-    detected_languages = detect_languages(prompt, all_languages)
-    
-    if not detected_languages:
-        logger.info("No language detected, defaulting to English.")
-        detected_languages.append("english")
+    if not lang_data:
+        # Fallback to a generic English file if model-specific file is not found
+        lang_id = "english_default"
+        lang_data = load_language_data(lang_id)
+        if not lang_data:
+            logger.warning(f"No language data found for model '{model}' or default. Returning original prompt.")
+            return jsonify({"cleanedPrompt": prompt})
+
+    logger.info(f"Using language rules from: {lang_id}")
     
     cleaned_prompt = prompt
-    for lang_id in detected_languages:
-        lang_data = all_languages.get(lang_id)
-        if lang_data:
-            phrases_to_remove = lang_data.get("phrases", [])
-            cleaned_prompt = filter_filler_words(cleaned_prompt, phrases_to_remove)
-            
+    rules = lang_data.get("rules", [])
+    
+    # Process the text using the rules from the loaded language file
+    cleaned_prompt = process_text_with_rules(cleaned_prompt, rules)
+    
+    # Final punctuation and spacing cleanup
     cleaned_prompt = clean_punctuation(cleaned_prompt)
+    
     logger.info(f"Original prompt: '{prompt}'")
     logger.info(f"Cleaned prompt: '{cleaned_prompt}'")
     
