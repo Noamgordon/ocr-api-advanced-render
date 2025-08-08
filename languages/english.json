@@ -1,0 +1,12 @@
+{
+  "id": "english",
+  "name": "English",
+  "version": "1.0.0",
+  "detection": {
+    "characters": "abcdefghijklmnopqrstuvwxyz",
+    "threshold": 0.3
+  },
+  "phrases": [ 
+    "absolutely", "actually", "anyway", "anyways", "as a matter of fact", "as far as i know", "as you may already know", "at your earliest convenience", "basically", "by the way", "can you", "can you please", "certainly", "completely", "could you", "could you please", "definitely", "do you think you could", "due to the fact that", "entirely", "extremely", "feel free to", "for your information", "frankly", "fully", "fyi", "greetings", "hello", "hey", "hi", "honestly", "i believe", "i believe that", "i feel", "i feel that", "i guess", "i need you to", "i think", "i think that", "i want to know", "i want you to", "i was hoping you could", "i was just wondering", "i was wondering if", "i wonder if", "i would appreciate it if", "i would be grateful if", "i would like to know", "i would like you to", "i would to know", "i would you to", "i'm wondering if", "id like to know", "id like you to", "id to know", "id you to", "i'd like to know", "i'd like you to", "i'd to know", "i'd you to", "if it's not too much trouble", "if you don't mind", "if you wouldn’t mind", "im wondering if", "in advance", "in my honest opinion", "in my opinion", "in order to", "it goes without saying", "it is important to note that", "it should be noted that", "just", "just curious", "just wondering", "kind of", "kindly", "literally", "maybe", "needless to say", "note that", "perhaps", "personally", "please", "please note that", "possibly", "probably", "quite", "really", "seriously", "somewhat", "sort of", "thank you", "thank you in advance", "thanks", "thanks in advance", "to be honest", "to tell you the truth", "totally", "very", "would it be possible to", "would you", "would you kindly", "would you mind", "would you please", "you know", "you see" 
+]
+}
