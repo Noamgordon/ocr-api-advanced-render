@@ -1,0 +1,53 @@
+{
+  "id": "english_gpt-4o",
+  "name": "English for GPT-4o",
+  "version": "1.0.0",
+  "detection": {
+    "characters": "abcdefghijklmnopqrstuvwxyz",
+    "threshold": 0.3
+  },
+  "rules": [
+    {
+      "action": "replace",
+      "phrases": [
+        "cant",
+        "can not",
+        "can't",
+        "cannot"
+      ],
+      "with": "can't",
+      "stop_phrases": [
+        "cant handle the truth",
+        "cant stop laughing"
+      ]
+    },
+    {
+      "action": "remove",
+      "phrases": [
+        "absolutely",
+        "actually",
+        "anyway",
+        "anyways"
+      ],
+      "stop_phrases": [
+        "absolutely fantastic"
+      ]
+    },
+    {
+      "action": "replace",
+      "phrases": [
+        "thank you"
+      ],
+      "with": "thanks",
+      "stop_phrases": [
+        "thank you page"
+      ]
+    },
+    {
+      "action": "remove",
+      "phrases": [
+        "you know"
+      ]
+    }
+  ]
+}
