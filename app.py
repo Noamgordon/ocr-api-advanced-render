@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 def load_language_data(lang_id):
     """Loads language data from a JSON file and caches it."""
     lang_file_path = os.path.join(
-        os.path.dirname(__file__), "Languages", f"{lang_id}.json"
+        os.path.dirname(__file__), "languages", f"{lang_id}.json"
     )
     if not os.path.exists(lang_file_path):
         logger.warning(f"Language file not found: {lang_file_path}")
