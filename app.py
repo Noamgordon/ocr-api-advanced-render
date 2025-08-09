@@ -110,6 +110,7 @@ def process_text_with_rules(text, rules):
 
 # New function to check the API key against the database
 def verify_api_key_in_db(api_key):
+    conn = None # conn is initialized here to prevent the error
     try:
         # We need a new connection for each thread in Gunicorn
         conn = psycopg2.connect(
