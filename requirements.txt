@@ -4,3 +4,4 @@ requests
 pdfminer.six
 PyMuPDF
 PyJWT
+psycopg2-binary 
