@@ -3,8 +3,9 @@ import os
 import json
 import re
 import logging
-from functools import lru_cache
-from flask import Flask, request, jsonify
+import jwt
+from functools import lru_cache, wraps
+from flask import Flask, request, jsonify, g
 
 app = Flask(__name__)
 
@@ -13,6 +14,12 @@ logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
+
+# Load the JWT secret key from environment variables.
+# This key must be a long, random, and secure string.
+JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY')
+if not JWT_SECRET_KEY:
+    raise ValueError("JWT_SECRET_KEY environment variable not set. This is required for API security.")
 
 # Cache language data to avoid re-reading files on every request
 @lru_cache(maxsize=32)
@@ -94,7 +101,33 @@ def process_text_with_rules(text, rules):
     
     return cleaned_text
 
+# New decorator for token authentication
+def token_required(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = None
+        # Check for Authorization header
+        if 'Authorization' in request.headers:
+            token = request.headers['Authorization'].split(" ")[1]
+        
+        if not token:
+            return jsonify({'message': 'Token is missing!'}), 401
+        
+        try:
+            # Decode and verify the token using your secret key
+            data = jwt.decode(token, JWT_SECRET_KEY, algorithms=["HS256"])
+            # 'g' is a global flask object to store user data
+            g.user = data['sub'] # 'sub' is the user ID from Supabase JWT
+        except jwt.ExpiredSignatureError:
+            return jsonify({'message': 'Token has expired!'}), 401
+        except jwt.InvalidTokenError:
+            return jsonify({'message': 'Token is invalid!'}), 401
+        
+        return f(*args, **kwargs)
+    return decorated
+
 @app.route("/clean", methods=["POST"])
+@token_required # Apply the decorator here to protect the endpoint
 def clean_text_service():
     """API endpoint to clean text based on language and model rules."""
     data = request.json
@@ -105,11 +138,13 @@ def clean_text_service():
         logger.warning("Received an empty prompt.")
         return jsonify({"cleanedPrompt": ""})
     
+    # User ID from the token, if you need to log it or use it
+    # logger.info(f"User '{g.user}' is making a request.")
+    
     lang_id = f"english_{model.lower()}"
     lang_data = load_language_data(lang_id)
     
     if not lang_data:
-        # Fallback to a generic English file if model-specific file is not found
         lang_id = "english_default"
         lang_data = load_language_data(lang_id)
         if not lang_data:
@@ -121,10 +156,7 @@ def clean_text_service():
     cleaned_prompt = prompt
     rules = lang_data.get("rules", [])
     
-    # Process the text using the rules from the loaded language file
     cleaned_prompt = process_text_with_rules(cleaned_prompt, rules)
-    
-    # Final punctuation and spacing cleanup
     cleaned_prompt = clean_punctuation(cleaned_prompt)
     
     logger.info(f"Original prompt: '{prompt}'")
