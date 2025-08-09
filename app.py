@@ -4,6 +4,7 @@ import json
 import re
 import logging
 import jwt
+import psycopg2
 from functools import lru_cache, wraps
 from flask import Flask, request, jsonify, g
 
@@ -16,10 +17,16 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Load the JWT secret key from environment variables.
-# This key must be a long, random, and secure string.
 JWT_SECRET_KEY = os.environ.get('JWT_SECRET_KEY')
 if not JWT_SECRET_KEY:
     raise ValueError("JWT_SECRET_KEY environment variable not set. This is required for API security.")
+
+# Load database credentials from environment variables
+DB_HOST = os.environ.get("DB_HOST")
+DB_NAME = os.environ.get("DB_NAME")
+DB_USER = os.environ.get("DB_USER")
+DB_PASSWORD = os.environ.get("DB_PASSWORD")
+DB_PORT = os.environ.get("DB_PORT", "5432")
 
 # Cache language data to avoid re-reading files on every request
 @lru_cache(maxsize=32)
@@ -101,35 +108,94 @@ def process_text_with_rules(text, rules):
     
     return cleaned_text
 
-# New decorator for token authentication
+# New function to check the API key against the database
+def verify_api_key_in_db(api_key):
+    try:
+        # We need a new connection for each thread in Gunicorn
+        conn = psycopg2.connect(
+            host=DB_HOST,
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASSWORD,
+            port=DB_PORT,
+            sslmode='require' # Supabase requires SSL
+        )
+        cur = conn.cursor()
+        
+        # The key is hashed inside the database for verification.
+        # This is a secure way to compare without exposing the key.
+        cur.execute("""
+            SELECT user_id, is_active FROM api_keys
+            WHERE crypt(%s, key_hash) = key_hash AND is_active = TRUE;
+        """, (api_key,))
+        
+        result = cur.fetchone()
+        
+        # If a valid key is found, update the last_used_at timestamp.
+        if result:
+            user_id = result[0]
+            cur.execute("""
+                UPDATE api_keys SET last_used_at = NOW() WHERE crypt(%s, key_hash) = key_hash;
+            """, (api_key,))
+            conn.commit()
+            return user_id
+        
+    except psycopg2.Error as e:
+        logger.error(f"Database error during key verification: {e}")
+        # In case of an error, assume the key is invalid
+        return None
+    finally:
+        if conn:
+            cur.close()
+            conn.close()
+    return None
+
+# New decorator to handle both JWT and custom API keys
 def token_required(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        token = None
-        # Check for Authorization header
-        if 'Authorization' in request.headers:
-            token = request.headers['Authorization'].split(" ")[1]
-        
-        if not token:
-            return jsonify({'message': 'Token is missing!'}), 401
+        auth_header = request.headers.get('Authorization')
+        user_id = None
+
+        if not auth_header:
+            return jsonify({'message': 'Authorization header is missing.'}), 401
         
         try:
-            # Decode and verify the token using your secret key
-            data = jwt.decode(token, JWT_SECRET_KEY, algorithms=["HS256"])
-            # 'g' is a global flask object to store user data
-            g.user = data['sub'] # 'sub' is the user ID from Supabase JWT
-        except jwt.ExpiredSignatureError:
-            return jsonify({'message': 'Token has expired!'}), 401
-        except jwt.InvalidTokenError:
-            return jsonify({'message': 'Token is invalid!'}), 401
+            # Check for a standard Bearer JWT token from Supabase
+            if auth_header.startswith('Bearer '):
+                token = auth_header.split(" ")[1]
+                data = jwt.decode(token, JWT_SECRET_KEY, algorithms=["HS256"])
+                user_id = data.get('sub')
+                if not user_id:
+                    return jsonify({'message': 'Invalid JWT token.'}), 401
+                logger.info(f"User authenticated with JWT: {user_id}")
+
+            # Check for a custom API Key
+            elif auth_header.startswith('sk_'):
+                api_key = auth_header
+                user_id = verify_api_key_in_db(api_key)
+                if not user_id:
+                    return jsonify({'message': 'Invalid or inactive API key.'}), 401
+                logger.info(f"User authenticated with API key: {user_id}")
+
+            else:
+                return jsonify({'message': 'Authorization header format is invalid.'}), 401
+
+            g.user = user_id
+            
+        except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+            return jsonify({'message': 'Token has expired or is invalid!'}), 401
+        except Exception as e:
+            logger.error(f"Authentication error: {e}")
+            return jsonify({'message': f'Authentication failed: {e}'}), 401
         
         return f(*args, **kwargs)
     return decorated
 
 @app.route("/clean", methods=["POST"])
-@token_required # Apply the decorator here to protect the endpoint
+@token_required
 def clean_text_service():
-    """API endpoint to clean text based on language and model rules."""
+    """API endpoint to clean text based on language and model rules, with API key authentication."""
     data = request.json
     prompt = data.get("prompt", "")
     model = data.get("model", "default")
@@ -138,8 +204,7 @@ def clean_text_service():
         logger.warning("Received an empty prompt.")
         return jsonify({"cleanedPrompt": ""})
     
-    # User ID from the token, if you need to log it or use it
-    # logger.info(f"User '{g.user}' is making a request.")
+    logger.info(f"Request from user '{g.user}'.")
     
     lang_id = f"english_{model.lower()}"
     lang_data = load_language_data(lang_id)
